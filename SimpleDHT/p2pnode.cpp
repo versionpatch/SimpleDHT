@@ -2,7 +2,54 @@
 #include <chrono>
 
 
+//helpers
+Message encode_transaction(const transaction &tc)
+{
+	Message m;
+	m.header.context = message_context::transaction_prepare;
+	//transaction id + for each record, key and data size
+	m.header.size = sizeof(uint64_t) + tc.records.size() * (sizeof(uint64_t) + sizeof(uint64_t));
+	for (auto& record : tc.records)
+	{
+		m.header.size += record.data.size();
+	}
+	m.data.resize(m.header.size);
+	std::memcpy(m.data.data(), &tc.id, sizeof(uint64_t));
+	size_t cursor = sizeof(uint64_t);
+	for (auto& record : tc.records)
+	{
+		std::memcpy((m.data.data() + cursor), &record.key, sizeof(uint64_t));
+		cursor += sizeof(uint64_t);
+		size_t record_size = record.data.size();
+		std::memcpy((m.data.data() + cursor), &record_size, sizeof(uint64_t));
+		cursor += sizeof(uint64_t);
+		std::memcpy((m.data.data() + cursor), record.data.data(), record.data.size());
+		cursor += sizeof(uint64_t);
+	}
+	return m;
+}
 
+transaction decode_transaction(const Message& m)
+{
+	size_t id = 0;
+	std::memcpy(&id, m.data.data(), 8);
+	transaction tc(id);
+	size_t cursor = sizeof(uint64_t);
+	while (cursor < m.header.size)
+	{
+		size_t key;
+		size_t record_size;
+		std::memcpy(&key, (m.data.data() + cursor), 8);
+		cursor += sizeof(uint64_t);
+		std::memcpy(&record_size, (m.data.data() + cursor), 8);
+		cursor += sizeof(uint64_t);
+		auto &record = tc.records.emplace_back(key);
+		record.data.resize(record_size);
+		std::memcpy(record.data.data(), (m.data.data() + cursor), record_size);
+		cursor += record_size;
+	}
+	return tc;
+}
 
 p2p_node::p2p_node(uint16_t port, size_t id) : 
 	context(),
@@ -182,10 +229,53 @@ void p2p_node::read_one_message()
 		}
 		case message_context::transaction_prepare :
 		{
-			size_t trans_id;
-			read_message_data<size_t>(trans_id, msg);
-			Message m = build_message(message_context::transaction_accept, trans_id);
-			con->send_message(m);
+			transaction tc = decode_transaction(msg);
+			auto handle_new_transaction = [this, con, tc]()
+			{
+				{
+					xstatus_accessor accessor;
+					transaction_status_table.insert(accessor, tc.id);
+					accessor->second = transaction_status::pending;
+				}
+				std::unordered_map<size_t, data_accessor> data_accessors;
+				for (auto& record : tc.records)
+				{
+					data_accessors.emplace(std::piecewise_construct, std::make_tuple(record.key), std::make_tuple());
+					if (!data_storage.find(data_accessors[record.key], record.key))
+					{
+						data_storage.insert(data_accessors[record.key], record.key);
+					}
+				}
+				Message m = build_message(message_context::transaction_accept, tc.id);
+				con->send_message(m);
+				transaction_status stat = transaction_status::pending;
+				while (true)
+				{
+					std::unique_lock lock(cv_mutex);
+					xstatus_caccessor stat_accessor;
+					transaction_status_table.find(stat_accessor, tc.id);
+					stat = (stat_accessor->second);
+					stat_accessor.release();
+					if (stat != transaction_status::pending)
+						break;
+					transaction_cv.wait(lock);
+				}
+				if (stat == transaction_status::committed)
+				{
+					for (auto& record : tc.records)
+					{
+						data_accessors[record.key]->second = record.data;
+					}
+					std::cout << "[LOG] Committed transaction " << tc.id << " successfully.\n";
+				}
+				else
+				{
+					std::cout << "[LOG] Aborted transaction " << tc.id << ".\n";
+				}
+
+			};
+			std::thread t(handle_new_transaction);
+			t.detach();
 			break;
 		}
 		case message_context::transaction_accept :
@@ -220,14 +310,28 @@ void p2p_node::read_one_message()
 		{
 			size_t trans_id;
 			read_message_data<size_t>(trans_id, msg);
-			std::cout << "[LOG] Committed " << trans_id << "\n";
+
+			xstatus_accessor accessor;
+			std::shared_lock tlock(table_lock);
+
+			transaction_status_table.find(accessor, trans_id);
+			accessor->second = transaction_status::committed;
+
+			transaction_cv.notify_all();
 			break;
 		}
 		case message_context::transaction_abort:
 		{
 			size_t trans_id;
 			read_message_data<size_t>(trans_id, msg);
-			std::cout << "[LOG] Aborted " << trans_id << "\n";
+
+			xstatus_accessor accessor;
+			std::shared_lock tlock(table_lock);
+
+			transaction_status_table.find(accessor, trans_id);
+			accessor->second = transaction_status::aborted;
+
+			transaction_cv.notify_all();
 			break;
 		}
 
@@ -418,10 +522,20 @@ void p2p_node::start_2pc(const transaction &tc)
 			}
 		}
 
+		std::unordered_map<size_t, data_accessor> data_accessors;
+		for (auto& record : tc.records)
+		{
+			data_accessors.emplace(std::piecewise_construct, std::make_tuple(record.key), std::make_tuple());
+			if (!data_storage.find(data_accessors[record.key], record.key))
+			{
+				data_storage.insert(data_accessors[record.key], record.key);
+			}
+		}
+		
+		Message prepare_msg = encode_transaction(tc);
 		for (auto replica : replicas_id)
 		{
-			Message m = build_message(message_context::transaction_prepare, xid);
-			established_connections[replica]->send_message(m);
+			established_connections[replica]->send_message(prepare_msg);
 		}
 
 		while (true)
@@ -452,19 +566,24 @@ void p2p_node::start_2pc(const transaction &tc)
 		transaction_status_table.find(stat_accessor, xid);
 		if (stat_accessor->second == transaction_status::pending)
 		{
+			Message m = build_message(message_context::transaction_commit, tc.id);
 			for (auto replica : replicas_id)
 			{
-				Message m = build_message(message_context::transaction_commit, tc.id);
 				established_connections[replica]->send_message(m);
 			}
+			for (auto& record : tc.records)
+			{
+				data_accessors[record.key]->second = record.data;
+			}
 			stat_accessor->second = transaction_status::committed;
+
 			std::cout << "[LOG] Committed transaction " << tc.id << " successfully.\n";
 		}
 		else
 		{
+			Message m = build_message(message_context::transaction_abort, tc.id);
 			for (auto replica : replicas_id)
-			{
-				Message m = build_message(message_context::transaction_abort, tc.id);
+			{	
 				established_connections[replica]->send_message(m);
 			}
 			std::cout << "[LOG] Aborted transaction " << tc.id << " successfully.\n";
