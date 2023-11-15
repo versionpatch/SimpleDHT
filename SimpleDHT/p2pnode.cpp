@@ -2,6 +2,8 @@
 #include <chrono>
 
 
+
+
 p2p_node::p2p_node(uint16_t port, size_t id) : 
 	context(),
 	acceptor(context, tcp::endpoint(tcp::v4(), port)),
@@ -190,9 +192,13 @@ void p2p_node::read_one_message()
 		{
 			size_t trans_id;
 			read_message_data<size_t>(trans_id, msg);
-			std::unique_lock xlock(transaction_lock);
+
+			xans_accessor accessor;
 			std::shared_lock tlock(table_lock);
-			transaction_ans[trans_id].insert(connection_to_id[con]);
+
+			transaction_ans.find(accessor, trans_id);
+			accessor->second.insert(connection_to_id[con]);
+
 			transaction_cv.notify_all();
 			break;
 		}
@@ -200,9 +206,13 @@ void p2p_node::read_one_message()
 		{
 			size_t trans_id;
 			read_message_data<size_t>(trans_id, msg);
-			std::unique_lock xlock(transaction_lock);
+
+			xstatus_accessor accessor;
 			std::shared_lock tlock(table_lock);
-			transaction_status_table[trans_id] = transaction_status::aborted;
+
+			transaction_status_table.find(accessor, trans_id);
+			accessor->second = transaction_status::aborted;
+
 			transaction_cv.notify_all();
 			break;
 		}
@@ -386,10 +396,17 @@ void p2p_node::start_2pc(const transaction &tc)
 {
 	auto work = [this, tc]()
 	{
-		std::unique_lock xlock(transaction_lock);
 		size_t xid = tc.id;
-		transaction_ans[xid] = std::unordered_set<size_t>();
-		transaction_status_table[xid] = transaction_status::pending;
+		{
+			xans_accessor ans_accessor;
+			xstatus_accessor stat_accessor;
+
+			transaction_ans.insert(ans_accessor, xid);
+			ans_accessor->second = std::unordered_set<size_t>();
+			transaction_status_table.insert(stat_accessor, xid);
+			stat_accessor->second = transaction_status::pending;
+		}
+
 		std::vector<size_t> replicas_id = std::vector<size_t>();
 
 		int idx = get_node_index(my_info.id);
@@ -400,23 +417,47 @@ void p2p_node::start_2pc(const transaction &tc)
 				replicas_id.push_back(connected_ids[(idx + i) % connected_ids.size()]);
 			}
 		}
+
 		for (auto replica : replicas_id)
 		{
 			Message m = build_message(message_context::transaction_prepare, xid);
 			established_connections[replica]->send_message(m);
 		}
-		while ((transaction_ans.size() < replication_count - 1) || (transaction_status_table[xid] == transaction_status::pending))
+
+		while (true)
 		{
-			transaction_cv.wait(xlock);
+			std::unique_lock lock(cv_mutex);
+			bool finished = false;
+			{
+				{
+					xans_caccessor ans_accessor;
+					transaction_ans.find(ans_accessor, xid);
+					finished |= ans_accessor->second.size() >= (replication_count - 1);
+				}
+				if (!finished)
+				{
+					xstatus_caccessor stat_accessor;
+					transaction_status_table.find(stat_accessor, xid);
+					bool cond2 = (stat_accessor->second) == transaction_status::aborted;
+				}
+			}
+			if (finished)
+			{
+				break;
+			}
+			transaction_cv.wait(lock);
 		}
-		if (transaction_status_table[xid] == transaction_status::pending)
+
+		xstatus_accessor stat_accessor;
+		transaction_status_table.find(stat_accessor, xid);
+		if (stat_accessor->second == transaction_status::pending)
 		{
 			for (auto replica : replicas_id)
 			{
 				Message m = build_message(message_context::transaction_commit, tc.id);
 				established_connections[replica]->send_message(m);
 			}
-			transaction_status_table[xid] = transaction_status::committed;
+			stat_accessor->second = transaction_status::committed;
 			std::cout << "[LOG] Committed transaction " << tc.id << " successfully.\n";
 		}
 		else
@@ -432,9 +473,11 @@ void p2p_node::start_2pc(const transaction &tc)
 	auto timeout_work = [this, tc]()
 	{
 		std::this_thread::sleep_for(commit_max_time);
-		std::unique_lock xlock(transaction_lock);
-		if (transaction_status_table[tc.id] == transaction_status::pending)
-			transaction_status_table[tc.id] = transaction_status::aborted;
+		xstatus_accessor stat_accessor;
+		transaction_status_table.find(stat_accessor, tc.id);
+		if (stat_accessor->second == transaction_status::pending)
+			stat_accessor->second = transaction_status::aborted;
+		std::unique_lock lock(cv_mutex);
 		transaction_cv.notify_all();
 	};
 	std::thread th(work);

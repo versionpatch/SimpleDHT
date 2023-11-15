@@ -10,6 +10,7 @@
 #include <iostream>
 #include <thread>
 #include <random>
+#include <tbb/concurrent_hash_map.h>
 
 #include "NodeTable.h"
 #include "Utils.h"
@@ -21,6 +22,14 @@
 static constexpr uint32_t localhost = 2130706433;
 using connection_ptr = std::shared_ptr<TCPConnection>;
 using tcp = asio::ip::tcp;
+
+using xans_caccessor = tbb::concurrent_hash_map<size_t, std::unordered_set<size_t>>::const_accessor;
+using xans_accessor = tbb::concurrent_hash_map<size_t, std::unordered_set<size_t>>::accessor;
+using xstatus_caccessor = tbb::concurrent_hash_map<size_t, transaction_status>::const_accessor;
+using xstatus_accessor = tbb::concurrent_hash_map<size_t, transaction_status>::accessor;
+using data_caccessor = tbb::concurrent_hash_map<size_t, std::vector<char>>::const_accessor;
+using data_accessor = tbb::concurrent_hash_map<size_t, std::vector<char>>::accessor;
+
 
 struct machine_info
 {
@@ -120,14 +129,16 @@ private:
 	void handle_heartbeat();
 	void broadcast_heartbeat();
 	
-	//Data handling
+	//Transaction handling
 	static constexpr size_t replication_count = 2;
-	std::unordered_map<size_t, std::unordered_set<size_t>> transaction_ans;
-	std::unordered_map<size_t, transaction_status> transaction_status_table;
+	tbb::concurrent_hash_map<size_t, std::unordered_set<size_t>> transaction_ans;
+	tbb::concurrent_hash_map<size_t, transaction_status> transaction_status_table;
 	static constexpr std::chrono::duration commit_max_time = std::chrono::milliseconds(5000);
-	std::mutex transaction_lock;
+	std::mutex cv_mutex;
 	std::condition_variable transaction_cv;
 	
+	//Data handling
+	tbb::concurrent_hash_map<size_t, std::vector<char>> data_storage;
 	
 
 

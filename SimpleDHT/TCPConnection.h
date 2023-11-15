@@ -17,7 +17,7 @@ struct Message
 };
 
 template<typename T>
-Message build_message(size_t context, const T &data)
+Message build_message(uint32_t context, const T &data)
 {
 	static_assert(std::is_standard_layout<T>::value == true);
 	Message m;
@@ -35,7 +35,7 @@ void read_message_data(T& val, const Message &m)
 }
 
 template<typename T>
-Message build_message_array(size_t context, const std::vector<T>& content)
+Message build_message_array(uint32_t context, const std::vector<T>& content)
 {
 	static_assert(std::is_standard_layout<T>::value == true);
 	Message m;
