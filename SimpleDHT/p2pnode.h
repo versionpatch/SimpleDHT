@@ -149,7 +149,7 @@ private:
 	static constexpr size_t replication_count = 2;
 	tbb::concurrent_hash_map<size_t, std::unordered_set<size_t>> transaction_ans;
 	tbb::concurrent_hash_map<size_t, transaction_status> transaction_status_table;
-	static constexpr std::chrono::duration commit_max_time = std::chrono::milliseconds(5000);
+	static constexpr std::chrono::duration commit_max_time = std::chrono::milliseconds(10000);
 	std::mutex cv_mutex;
 	std::condition_variable transaction_cv;
 	//This lock is to stop transactions during the final phase of a synchronization. It's basically equivalent a lock on the entire data table.

@@ -269,6 +269,7 @@ void p2p_node::read_one_message()
 				}
 				Message m = build_message(message_context::transaction_accept, tc.id);
 				con->send_message(m);
+
 				transaction_status stat = transaction_status::pending;
 				while (true)
 				{
@@ -399,13 +400,12 @@ void p2p_node::read_one_message()
 				{
 					std::unique_lock u(global_transaction_lock, std::defer_lock);
 					std::shared_lock s(global_transaction_lock);
-					size_t num_transactions = committed_transactions.size();
 					size_t seq_number = ask_msg.seq;
 					size_t last_seq_number = -1;
-					while (num_transactions > seq_number)
+					while (committed_transactions.size() > seq_number)
 					{
 						//check for an update
-						bool final_phase = synchronization_batch_size > (num_transactions - seq_number);
+						bool final_phase = synchronization_batch_size > (committed_transactions.size() - seq_number);
 						if (final_phase)
 						{
 							s.unlock();
@@ -454,7 +454,10 @@ void p2p_node::read_one_message()
 					Message done_message;
 					done_message.header.context = message_context::sync_done;
 					con->send_message(done_message);
-					std::cout << "Finished synchronization with machine " << ask_msg.id << ".\n";
+					sync_accessor delete_accessor;
+					if (sync_progress.find(delete_accessor, ask_msg.id))
+						sync_progress.erase(delete_accessor);
+					std::cout << "Finished synchronization with machine " << ask_msg.id << " : " << seq_number << "/" << committed_transactions.size() << ".\n";
 				};
 				std::thread t(handle_sync);
 				t.detach();
@@ -663,7 +666,6 @@ void p2p_node::start_2pc(const transaction &tc)
 	auto work = [this, tc]()
 	{
 		size_t xid = tc.id;
-		//If this is taken by a unique lock, then we are in a synchronization phase and no new transactions can be started.
 		std::shared_lock global_xlock(global_transaction_lock);
 
 		std::vector<size_t> replicas_id = std::vector<size_t>();

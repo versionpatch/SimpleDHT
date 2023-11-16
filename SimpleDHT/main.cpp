@@ -49,7 +49,7 @@ int main()
 			server.connect_to_all();
 		else if (port == 2)
 		{
-			for (size_t i = 0; i < 10000; i++)
+			for (size_t i = 0; i < 50000; i++)
 			{
 				transaction t(i);
 				auto& record = t.add_entry(i % 3000);
