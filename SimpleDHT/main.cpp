@@ -49,12 +49,15 @@ int main()
 			server.connect_to_all();
 		else if (port == 2)
 		{
-			for (size_t i = 0; i < 50000; i++)
+			size_t i = 0;
+			while (true)
 			{
+				std::this_thread::sleep_for(std::chrono::microseconds(300));
 				transaction t(i);
-				auto& record = t.add_entry(i % 3000);
-				record.data.push_back(0);
+				t.key = i % 3000;
+				t.data.push_back(0);
 				server.start_2pc(t);
+				i++;
 			}
 		}
 		else if (port == 3)

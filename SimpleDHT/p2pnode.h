@@ -51,34 +51,17 @@ struct machine_info
 	}
 };
 
-struct write_entry
-{
-	size_t key;
-	std::vector<char> data;
-	write_entry(size_t k) : key(k)
-	{
-
-	}
-	write_entry() : key(0)
-	{
-
-	}
-};
 struct transaction
 {
 	transaction(size_t uid) : id(uid)
 	{
 
 	}
-	write_entry& add_entry(size_t key)
-	{
-		auto cmp = [](const write_entry& w1, const write_entry& w2) {return w1.key < w2.key; };
-		auto it = std::upper_bound(records.begin(), records.end(), key, cmp);
-		return *(records.insert(it, key));
-	}
+
 	size_t id;
-	//sorted
-	std::vector<write_entry> records;
+	size_t key;
+	std::vector<char> data;
+
 };
 
 

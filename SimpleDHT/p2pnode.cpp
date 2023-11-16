@@ -7,19 +7,13 @@ char* encode_transaction(char* dest, const transaction &tc)
 {
 	std::memcpy(dest, &tc.id, sizeof(uint64_t));
 	dest += sizeof(uint64_t);
-	size_t num_records = tc.records.size();
-	std::memcpy(dest, &num_records, sizeof(uint64_t));
+	std::memcpy(dest, &tc.key, sizeof(uint64_t));
 	dest += sizeof(uint64_t);
-	for (auto& record : tc.records)
-	{
-		std::memcpy((dest), &record.key, sizeof(uint64_t));
-		dest += sizeof(uint64_t);
-		size_t record_size = record.data.size();
-		std::memcpy((dest), &record_size, sizeof(uint64_t));
-		dest += sizeof(uint64_t);
-		std::memcpy((dest), record.data.data(), record.data.size());
-		dest += record.data.size();
-	}
+	size_t record_size = tc.data.size();
+	std::memcpy(dest, &record_size, sizeof(uint64_t));
+	dest += sizeof(uint64_t);
+	std::memcpy(dest, tc.data.data(), record_size);
+	dest += record_size;
 	return dest;
 }
 
@@ -27,11 +21,7 @@ Message encode_transaction(const transaction& tc)
 {
 	Message m;
 	m.header.context = message_context::transaction_prepare;
-	m.header.size = sizeof(uint64_t) + sizeof(uint64_t) + tc.records.size() * (sizeof(uint64_t) + sizeof(uint64_t));
-	for (auto& record : tc.records)
-	{
-		m.header.size += record.data.size();
-	}
+	m.header.size = 3 * sizeof(uint64_t) + sizeof(uint64_t) + tc.data.size();
 	m.data.resize(m.header.size);
 	encode_transaction(m.data.data(), tc);
 	return m;
@@ -39,26 +29,16 @@ Message encode_transaction(const transaction& tc)
 
 const char* decode_transaction(transaction &dest, const char* src)
 {
-	size_t id = 0;
-	std::memcpy(&id, src, sizeof(uint64_t));
+	std::memcpy(&dest.id, src, sizeof(uint64_t));
 	src += sizeof(uint64_t);
-	dest.id = id;
-	size_t num_records = 0;
-	std::memcpy(&num_records, src, sizeof(uint64_t));
+	std::memcpy(&dest.key, src, sizeof(uint64_t));
 	src += sizeof(uint64_t);
-	for (size_t i = 0;i < num_records;i++)
-	{
-		size_t key;
-		size_t record_size;
-		std::memcpy(&key, src, sizeof(uint64_t));
-		src += sizeof(uint64_t);
-		std::memcpy(&record_size, src, sizeof(uint64_t));
-		src += sizeof(uint64_t);
-		auto &record = dest.records.emplace_back(key);
-		record.data.resize(record_size);
-		std::memcpy(record.data.data(), src, record_size);
-		src += record_size;
-	}
+	size_t record_size;
+	std::memcpy(&record_size, src, sizeof(uint64_t));
+	src += sizeof(uint64_t);
+	dest.data.resize(record_size);
+	std::memcpy(dest.data.data(), src, record_size);
+	src += record_size;
 	return src;
 }
 
@@ -258,19 +238,15 @@ void p2p_node::read_one_message()
 			}
 			auto handle_new_transaction = [this, con, tc]()
 			{
-				std::unordered_map<size_t, data_accessor> data_accessors;
-				for (auto& record : tc.records)
-				{
-					data_accessors.emplace(std::piecewise_construct, std::make_tuple(record.key), std::make_tuple());
-					if (!data_storage.find(data_accessors[record.key], record.key))
-					{
-						data_storage.insert(data_accessors[record.key], record.key);
-					}
-				}
+				data_accessor accessor;
+				bool new_key = !data_storage.find(accessor, tc.key);
+				if (new_key)
+					data_storage.insert(accessor, tc.key);
+
 				Message m = build_message(message_context::transaction_accept, tc.id);
 				con->send_message(m);
-
 				transaction_status stat = transaction_status::pending;
+
 				while (true)
 				{
 					std::unique_lock lock(cv_mutex);
@@ -284,16 +260,16 @@ void p2p_node::read_one_message()
 				}
 				if (stat == transaction_status::committed)
 				{
-					for (auto& record : tc.records)
-					{
-						data_accessors[record.key]->second = record.data;
-						keys.insert(record.key);
-					}
+					accessor->second = tc.data;
+					if (new_key)
+						keys.insert(tc.key);
 					committed_transactions.push_back(tc);
-					//std::cout << "[LOG] Committed transaction " << tc.id << " successfully.\n";
+					std::cout << "[LOG] Committed transaction " << tc.id << " successfully.\n";
 				}
 				else
 				{
+					if (new_key)
+						data_storage.erase(accessor);
 					std::cout << "[LOG] Aborted transaction " << tc.id << ".\n";
 				}
 
@@ -426,9 +402,7 @@ void p2p_node::read_one_message()
 						for (auto it = begin_it; it != end_it; it++)
 						{
 							auto& tc = *it;
-							size_t transaction_size = sizeof(uint64_t) + sizeof(uint64_t) + tc.records.size() * (sizeof(uint64_t) + sizeof(uint64_t));
-							for (auto& record : tc.records)
-								transaction_size += record.data.size();
+							size_t transaction_size = 3 * sizeof(uint64_t) + tc.data.size();
 							m.data.resize(m.header.size + transaction_size);
 							encode_transaction(m.data.data() + m.header.size, tc);
 							m.header.size += transaction_size;
@@ -679,15 +653,10 @@ void p2p_node::start_2pc(const transaction &tc)
 			}
 		}
 
-		std::unordered_map<size_t, data_accessor> data_accessors;
-		for (auto& record : tc.records)
-		{
-			data_accessors.emplace(std::piecewise_construct, std::make_tuple(record.key), std::make_tuple());
-			if (!data_storage.find(data_accessors[record.key], record.key))
-			{
-				data_storage.insert(data_accessors[record.key], record.key);
-			}
-		}
+		data_accessor accessor;
+		bool new_key = !data_storage.find(accessor, tc.key);
+		if (new_key)
+			data_storage.insert(accessor, new_key);
 		
 		Message prepare_msg = encode_transaction(tc);
 		for (auto replica : replicas_id)
@@ -728,11 +697,10 @@ void p2p_node::start_2pc(const transaction &tc)
 			{
 				established_connections[replica]->send_message(m);
 			}
-			for (auto& record : tc.records)
-			{
-				data_accessors[record.key]->second = record.data;
-				keys.insert(record.key);
-			}
+			accessor->second = tc.data;
+			if (new_key)
+				keys.insert(tc.key);
+
 			committed_transactions.push_back(tc);
 			stat_accessor->second = transaction_status::committed;
 
@@ -745,6 +713,8 @@ void p2p_node::start_2pc(const transaction &tc)
 			{	
 				established_connections[replica]->send_message(m);
 			}
+			if (new_key)
+				data_storage.erase(accessor);
 			std::cout << "[LOG] Aborted transaction " << tc.id << " successfully.\n";
 		}
 	};
