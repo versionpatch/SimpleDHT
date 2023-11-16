@@ -49,14 +49,17 @@ int main()
 			server.connect_to_all();
 		else if (port == 2)
 		{
-			for (size_t i = 0; i < 1000; i++)
+			for (size_t i = 0; i < 10000; i++)
 			{
 				transaction t(i);
-				t.records.emplace_back(i);
-				t.records[0].data.push_back(0);
+				auto& record = t.add_entry(i % 3000);
+				record.data.push_back(0);
 				server.start_2pc(t);
 			}
-
+		}
+		else if (port == 3)
+		{
+			server.send_sync_to_random_node();
 		}
 		else
 			server.establish_connection(localhost, port);

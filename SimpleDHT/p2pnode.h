@@ -10,7 +10,10 @@
 #include <iostream>
 #include <thread>
 #include <random>
+
 #include <tbb/concurrent_hash_map.h>
+#include <tbb/concurrent_set.h>
+#include <tbb/concurrent_vector.h>
 
 #include "NodeTable.h"
 #include "Utils.h"
@@ -29,6 +32,8 @@ using xstatus_caccessor = tbb::concurrent_hash_map<size_t, transaction_status>::
 using xstatus_accessor = tbb::concurrent_hash_map<size_t, transaction_status>::accessor;
 using data_caccessor = tbb::concurrent_hash_map<size_t, std::vector<char>>::const_accessor;
 using data_accessor = tbb::concurrent_hash_map<size_t, std::vector<char>>::accessor;
+using sync_caccessor = tbb::concurrent_hash_map<size_t, size_t>::const_accessor;
+using sync_accessor = tbb::concurrent_hash_map<size_t, size_t>::accessor;
 
 
 struct machine_info
@@ -54,6 +59,10 @@ struct write_entry
 	{
 
 	}
+	write_entry() : key(0)
+	{
+
+	}
 };
 struct transaction
 {
@@ -61,8 +70,14 @@ struct transaction
 	{
 
 	}
-
+	write_entry& add_entry(size_t key)
+	{
+		auto cmp = [](const write_entry& w1, const write_entry& w2) {return w1.key < w2.key; };
+		auto it = std::upper_bound(records.begin(), records.end(), key, cmp);
+		return *(records.insert(it, key));
+	}
 	size_t id;
+	//sorted
 	std::vector<write_entry> records;
 };
 
@@ -88,6 +103,7 @@ public:
 
 	//debug
 	void log_machine_table();
+	void send_sync_to_random_node();
 
 private:
 
@@ -136,9 +152,20 @@ private:
 	static constexpr std::chrono::duration commit_max_time = std::chrono::milliseconds(5000);
 	std::mutex cv_mutex;
 	std::condition_variable transaction_cv;
+	//This lock is to stop transactions during the final phase of a synchronization. It's basically equivalent a lock on the entire data table.
+	std::shared_mutex global_transaction_lock;
 	
 	//Data handling
 	tbb::concurrent_hash_map<size_t, std::vector<char>> data_storage;
+	tbb::concurrent_set<size_t> keys;
+	tbb::concurrent_vector<transaction> committed_transactions;
+
+	//Synchronization
+	tbb::concurrent_hash_map<size_t, size_t> sync_progress;
+	std::mutex sync_cv_mutex;
+	std::condition_variable sync_cv;
+	static constexpr size_t synchronization_batch_size = 128;
+	
 	
 
 

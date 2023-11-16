@@ -8,7 +8,7 @@
 struct MessageHeader
 {
 	uint32_t context;
-	uint32_t size;
+	uint32_t size = 0;
 };
 struct Message
 {

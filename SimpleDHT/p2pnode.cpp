@@ -3,51 +3,70 @@
 
 
 //helpers
-Message encode_transaction(const transaction &tc)
+char* encode_transaction(char* dest, const transaction &tc)
+{
+	std::memcpy(dest, &tc.id, sizeof(uint64_t));
+	dest += sizeof(uint64_t);
+	size_t num_records = tc.records.size();
+	std::memcpy(dest, &num_records, sizeof(uint64_t));
+	dest += sizeof(uint64_t);
+	for (auto& record : tc.records)
+	{
+		std::memcpy((dest), &record.key, sizeof(uint64_t));
+		dest += sizeof(uint64_t);
+		size_t record_size = record.data.size();
+		std::memcpy((dest), &record_size, sizeof(uint64_t));
+		dest += sizeof(uint64_t);
+		std::memcpy((dest), record.data.data(), record.data.size());
+		dest += record.data.size();
+	}
+	return dest;
+}
+
+Message encode_transaction(const transaction& tc)
 {
 	Message m;
 	m.header.context = message_context::transaction_prepare;
-	//transaction id + for each record, key and data size
-	m.header.size = sizeof(uint64_t) + tc.records.size() * (sizeof(uint64_t) + sizeof(uint64_t));
+	m.header.size = sizeof(uint64_t) + sizeof(uint64_t) + tc.records.size() * (sizeof(uint64_t) + sizeof(uint64_t));
 	for (auto& record : tc.records)
 	{
 		m.header.size += record.data.size();
 	}
 	m.data.resize(m.header.size);
-	std::memcpy(m.data.data(), &tc.id, sizeof(uint64_t));
-	size_t cursor = sizeof(uint64_t);
-	for (auto& record : tc.records)
-	{
-		std::memcpy((m.data.data() + cursor), &record.key, sizeof(uint64_t));
-		cursor += sizeof(uint64_t);
-		size_t record_size = record.data.size();
-		std::memcpy((m.data.data() + cursor), &record_size, sizeof(uint64_t));
-		cursor += sizeof(uint64_t);
-		std::memcpy((m.data.data() + cursor), record.data.data(), record.data.size());
-		cursor += sizeof(uint64_t);
-	}
+	encode_transaction(m.data.data(), tc);
 	return m;
+}
+
+const char* decode_transaction(transaction &dest, const char* src)
+{
+	size_t id = 0;
+	std::memcpy(&id, src, sizeof(uint64_t));
+	src += sizeof(uint64_t);
+	dest.id = id;
+	size_t num_records = 0;
+	std::memcpy(&num_records, src, sizeof(uint64_t));
+	src += sizeof(uint64_t);
+	for (size_t i = 0;i < num_records;i++)
+	{
+		size_t key;
+		size_t record_size;
+		std::memcpy(&key, src, sizeof(uint64_t));
+		src += sizeof(uint64_t);
+		std::memcpy(&record_size, src, sizeof(uint64_t));
+		src += sizeof(uint64_t);
+		auto &record = dest.records.emplace_back(key);
+		record.data.resize(record_size);
+		std::memcpy(record.data.data(), src, record_size);
+		src += record_size;
+	}
+	return src;
 }
 
 transaction decode_transaction(const Message& m)
 {
-	size_t id = 0;
-	std::memcpy(&id, m.data.data(), 8);
-	transaction tc(id);
-	size_t cursor = sizeof(uint64_t);
-	while (cursor < m.header.size)
-	{
-		size_t key;
-		size_t record_size;
-		std::memcpy(&key, (m.data.data() + cursor), 8);
-		cursor += sizeof(uint64_t);
-		std::memcpy(&record_size, (m.data.data() + cursor), 8);
-		cursor += sizeof(uint64_t);
-		auto &record = tc.records.emplace_back(key);
-		record.data.resize(record_size);
-		std::memcpy(record.data.data(), (m.data.data() + cursor), record_size);
-		cursor += record_size;
-	}
+	transaction tc(0);
+	auto start = m.data.data();
+	decode_transaction(tc, start);
 	return tc;
 }
 
@@ -177,6 +196,8 @@ void p2p_node::broadcast(const Message &m)
 	}
 }
 
+
+
 void p2p_node::read_one_message()
 {
 	auto pulled = in_messages.pop();
@@ -194,8 +215,8 @@ void p2p_node::read_one_message()
 			if (cut_connection(content.id))
 				std::cout << "[WARNING] A machine with the same id as " << content.id << " exists. It has been forcibly disconnected.\n";
 
-			Message record_msg = build_message(message_context::record, machine_info(con->get_hostname(), content.port, content.id));
-			broadcast(record_msg);
+			//Message record_msg = build_message(message_context::record, machine_info(con->get_hostname(), content.port, content.id));
+			//broadcast(record_msg);
 
 			add_new_machine(con, content.id, content.port);
 			if (msg.header.context == message_context::intro)
@@ -230,13 +251,13 @@ void p2p_node::read_one_message()
 		case message_context::transaction_prepare :
 		{
 			transaction tc = decode_transaction(msg);
+			{
+				xstatus_accessor accessor;
+				transaction_status_table.insert(accessor, tc.id);
+				accessor->second = transaction_status::pending;
+			}
 			auto handle_new_transaction = [this, con, tc]()
 			{
-				{
-					xstatus_accessor accessor;
-					transaction_status_table.insert(accessor, tc.id);
-					accessor->second = transaction_status::pending;
-				}
 				std::unordered_map<size_t, data_accessor> data_accessors;
 				for (auto& record : tc.records)
 				{
@@ -265,8 +286,10 @@ void p2p_node::read_one_message()
 					for (auto& record : tc.records)
 					{
 						data_accessors[record.key]->second = record.data;
+						keys.insert(record.key);
 					}
-					std::cout << "[LOG] Committed transaction " << tc.id << " successfully.\n";
+					committed_transactions.push_back(tc);
+					//std::cout << "[LOG] Committed transaction " << tc.id << " successfully.\n";
 				}
 				else
 				{
@@ -286,8 +309,14 @@ void p2p_node::read_one_message()
 			xans_accessor accessor;
 			std::shared_lock tlock(table_lock);
 
-			transaction_ans.find(accessor, trans_id);
-			accessor->second.insert(connection_to_id[con]);
+			if (transaction_ans.find(accessor, trans_id))
+			{
+				accessor->second.insert(connection_to_id[con]);
+			}
+			else
+			{
+				std::cerr << "ERROR ACCEPT\n";
+			}
 
 			transaction_cv.notify_all();
 			break;
@@ -300,8 +329,15 @@ void p2p_node::read_one_message()
 			xstatus_accessor accessor;
 			std::shared_lock tlock(table_lock);
 
-			transaction_status_table.find(accessor, trans_id);
-			accessor->second = transaction_status::aborted;
+			if (transaction_status_table.find(accessor, trans_id))
+			{ 
+				accessor->second = transaction_status::aborted;
+			}
+			else
+			{
+				std::cerr << "ERROR REFUSE\n";
+			}
+			
 
 			transaction_cv.notify_all();
 			break;
@@ -314,8 +350,14 @@ void p2p_node::read_one_message()
 			xstatus_accessor accessor;
 			std::shared_lock tlock(table_lock);
 
-			transaction_status_table.find(accessor, trans_id);
-			accessor->second = transaction_status::committed;
+			if (transaction_status_table.find(accessor, trans_id))
+			{
+				accessor->second = transaction_status::committed;
+			}
+			else
+			{
+				std::cerr << "ERROR COMMIT\n";
+			}
 
 			transaction_cv.notify_all();
 			break;
@@ -334,7 +376,116 @@ void p2p_node::read_one_message()
 			transaction_cv.notify_all();
 			break;
 		}
+		case message_context::sync_ask:
+		{
+			message_format::sync_ask ask_msg;
+			read_message_data(ask_msg, msg);
+			sync_accessor accessor;
+			std::cout << "[LOG] Received ask message " << ask_msg.id << ", " << ask_msg.seq << "\n";
+			if (sync_progress.find(accessor, ask_msg.id))
+			{
+				std::cout << "[LOG] Moving sync process for machine " << ask_msg.id << " to " << ask_msg.seq << ".\n";
+				accessor->second = ask_msg.seq;
+				std::unique_lock cv_lock(sync_cv_mutex);
+				sync_cv.notify_all();
+			}
+			else
+			{
+				std::cout << "[LOG] Starting sync process for machine " << ask_msg.id << " at " << ask_msg.seq << ".\n";
+				sync_progress.insert(accessor, ask_msg.id);
+				accessor->second = ask_msg.seq;
+				accessor.release();
+				auto handle_sync = [this, ask_msg, con]()
+				{
+					std::unique_lock u(global_transaction_lock, std::defer_lock);
+					std::shared_lock s(global_transaction_lock);
+					size_t num_transactions = committed_transactions.size();
+					size_t seq_number = ask_msg.seq;
+					size_t last_seq_number = -1;
+					while (num_transactions > seq_number)
+					{
+						//check for an update
+						bool final_phase = synchronization_batch_size > (num_transactions - seq_number);
+						if (final_phase)
+						{
+							s.unlock();
+							u.lock();
+						}
+						
+						size_t total_size = 0;
+						auto begin_it = committed_transactions.cbegin() + seq_number;
+						auto end_it = final_phase ? committed_transactions.cend() : begin_it + synchronization_batch_size;
+						size_t num_transactions_sent = final_phase ? (committed_transactions.size() - seq_number) : synchronization_batch_size;
 
+						Message m;
+						m.header.context = message_context::sync_ans;
+						m.header.size += 16;
+						m.data.resize(m.header.size);
+						std::memcpy(m.data.data(), &num_transactions_sent, 8);
+						std::memcpy(m.data.data() + 8, &seq_number, 8);
+						for (auto it = begin_it; it != end_it; it++)
+						{
+							auto& tc = *it;
+							size_t transaction_size = sizeof(uint64_t) + sizeof(uint64_t) + tc.records.size() * (sizeof(uint64_t) + sizeof(uint64_t));
+							for (auto& record : tc.records)
+								transaction_size += record.data.size();
+							m.data.resize(m.header.size + transaction_size);
+							encode_transaction(m.data.data() + m.header.size, tc);
+							m.header.size += transaction_size;
+						}
+
+						con->send_message(m);
+
+						//Wait for answer.
+						last_seq_number = seq_number;
+						while (true)
+						{
+							std::unique_lock cv_lock(sync_cv_mutex);
+							{
+								sync_caccessor accessor;
+								sync_progress.find(accessor, ask_msg.id);
+								seq_number = accessor->second;
+							}
+							if (seq_number != last_seq_number)
+								break;
+							sync_cv.wait(cv_lock);
+						}
+					}
+					Message done_message;
+					done_message.header.context = message_context::sync_done;
+					con->send_message(done_message);
+					std::cout << "Finished synchronization with machine " << ask_msg.id << ".\n";
+				};
+				std::thread t(handle_sync);
+				t.detach();
+			}
+			break;
+		}
+		case message_context::sync_ans:
+		{
+			size_t num_transactions_received;
+			size_t seq_number;
+			std::memcpy(&num_transactions_received, msg.data.data(), 8);
+			std::memcpy(&seq_number, msg.data.data() + 8, 8);
+			const char* cursor = msg.data.data() + 16;
+			std::cout << "[LOG] Received " << num_transactions_received << "\n";
+			for (size_t i = 0; i < num_transactions_received; i++)
+			{
+				transaction tc(0);
+				cursor = decode_transaction(tc, cursor);
+			}
+			message_format::sync_ask payload;
+			payload.id = my_info.id;
+			payload.seq = seq_number + num_transactions_received;
+			Message m = build_message(message_context::sync_ask, payload);
+			con->send_message(m);
+			break;
+		}
+		case message_context::sync_done:
+		{
+			std::cout << "Finished synchronization.\n";
+			break;
+		}
 
 		default:
 			break;
@@ -498,18 +649,22 @@ void p2p_node::broadcast_heartbeat()
 
 void p2p_node::start_2pc(const transaction &tc)
 {
+	size_t xid = tc.id;
+	{
+		xans_accessor ans_accessor;
+		xstatus_accessor stat_accessor;
+
+		transaction_ans.insert(ans_accessor, xid);
+		ans_accessor->second = std::unordered_set<size_t>();
+		transaction_status_table.insert(stat_accessor, xid);
+		stat_accessor->second = transaction_status::pending;
+	}
+
 	auto work = [this, tc]()
 	{
 		size_t xid = tc.id;
-		{
-			xans_accessor ans_accessor;
-			xstatus_accessor stat_accessor;
-
-			transaction_ans.insert(ans_accessor, xid);
-			ans_accessor->second = std::unordered_set<size_t>();
-			transaction_status_table.insert(stat_accessor, xid);
-			stat_accessor->second = transaction_status::pending;
-		}
+		//If this is taken by a unique lock, then we are in a synchronization phase and no new transactions can be started.
+		std::shared_lock global_xlock(global_transaction_lock);
 
 		std::vector<size_t> replicas_id = std::vector<size_t>();
 
@@ -574,10 +729,12 @@ void p2p_node::start_2pc(const transaction &tc)
 			for (auto& record : tc.records)
 			{
 				data_accessors[record.key]->second = record.data;
+				keys.insert(record.key);
 			}
+			committed_transactions.push_back(tc);
 			stat_accessor->second = transaction_status::committed;
 
-			std::cout << "[LOG] Committed transaction " << tc.id << " successfully.\n";
+			//std::cout << "[LOG] Committed transaction " << tc.id << " successfully.\n";
 		}
 		else
 		{
@@ -621,4 +778,14 @@ void p2p_node::log_machine_table()
 		std::cout << id << ",";
 	}
 	std::cout << '\n';
+}
+
+void p2p_node::send_sync_to_random_node()
+{
+	message_format::sync_ask first_ask;
+	first_ask.id = my_info.id;
+	first_ask.seq = 0;
+	Message m = build_message(message_context::sync_ask, first_ask);
+	auto it = established_connections.begin();
+	it->second->send_message(m);
 }
