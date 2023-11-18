@@ -247,17 +247,17 @@ void p2p_node::read_one_message()
 				con->send_message(m);
 				transaction_status stat = transaction_status::pending;
 
-				while (true)
-				{
-					std::unique_lock lock(cv_mutex);
-					xstatus_caccessor stat_accessor;
-					transaction_status_table.find(stat_accessor, tc.id);
-					stat = (stat_accessor->second);
-					stat_accessor.release();
-					if (stat != transaction_status::pending)
-						break;
-					transaction_cv.wait(lock);
-				}
+				std::unique_lock lock(cv_mutex);
+				transaction_cv.wait(lock, [&]()
+					{
+						xstatus_caccessor stat_accessor;
+						transaction_status_table.find(stat_accessor, tc.id);
+						stat = (stat_accessor->second);
+						stat_accessor.release();
+						return stat != transaction_status::pending;
+					}
+				);
+
 				if (stat == transaction_status::committed)
 				{
 					accessor->second = tc.data;
@@ -412,18 +412,15 @@ void p2p_node::read_one_message()
 
 						//Wait for answer.
 						last_seq_number = seq_number;
-						while (true)
-						{
-							std::unique_lock cv_lock(sync_cv_mutex);
+						std::unique_lock cv_lock(sync_cv_mutex);
+						sync_cv.wait(cv_lock, [&]()
 							{
 								sync_caccessor accessor;
 								sync_progress.find(accessor, ask_msg.id);
 								seq_number = accessor->second;
+								return seq_number != last_seq_number;
 							}
-							if (seq_number != last_seq_number)
-								break;
-							sync_cv.wait(cv_lock);
-						}
+						);
 					}
 					Message done_message;
 					done_message.header.context = message_context::sync_done;
@@ -664,29 +661,24 @@ void p2p_node::start_2pc(const transaction &tc)
 			established_connections[replica]->send_message(prepare_msg);
 		}
 
-		while (true)
-		{
-			std::unique_lock lock(cv_mutex);
-			bool finished = false;
+		std::unique_lock lock(cv_mutex);
+		transaction_cv.wait(lock, [&]()
 			{
-				{
-					xans_caccessor ans_accessor;
-					transaction_ans.find(ans_accessor, xid);
-					finished |= ans_accessor->second.size() >= (replication_count - 1);
-				}
+				bool finished = false;
+				xans_caccessor ans_accessor;
+				transaction_ans.find(ans_accessor, xid);
+				finished |= ans_accessor->second.size() >= (replication_count - 1);
+				ans_accessor.release();
 				if (!finished)
 				{
 					xstatus_caccessor stat_accessor;
 					transaction_status_table.find(stat_accessor, xid);
 					bool cond2 = (stat_accessor->second) == transaction_status::aborted;
+					finished |= cond2;
 				}
+				return finished;
 			}
-			if (finished)
-			{
-				break;
-			}
-			transaction_cv.wait(lock);
-		}
+		);
 
 		xstatus_accessor stat_accessor;
 		transaction_status_table.find(stat_accessor, xid);
