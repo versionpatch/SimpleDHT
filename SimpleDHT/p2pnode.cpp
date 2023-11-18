@@ -425,6 +425,15 @@ void p2p_node::read_one_message()
 					Message done_message;
 					done_message.header.context = message_context::sync_done;
 					con->send_message(done_message);
+					//Wait for termination recognition.
+					std::unique_lock cv_lock(sync_cv_mutex);
+					sync_cv.wait(cv_lock, [&]()
+						{
+							sync_caccessor accessor;
+							sync_progress.find(accessor, ask_msg.id);
+							return accessor->second == 0;
+						}
+					);
 					sync_accessor delete_accessor;
 					if (sync_progress.find(delete_accessor, ask_msg.id))
 						sync_progress.erase(delete_accessor);
@@ -457,10 +466,24 @@ void p2p_node::read_one_message()
 		}
 		case message_context::sync_done:
 		{
+			Message ack = build_message(message_context::sync_done_ack, my_info.id);
+			con->send_message(ack);
 			std::cout << "Finished synchronization.\n";
 			break;
 		}
-
+		case message_context::sync_done_ack:
+		{
+			size_t mid;
+			read_message_data(mid, msg);
+			sync_accessor accessor;
+			if (sync_progress.find(accessor, mid))
+			{
+				accessor->second = 0;
+				std::unique_lock cv_lock(sync_cv_mutex);
+				sync_cv.notify_all();
+			}
+			break;
+		}
 		default:
 			break;
 	}

@@ -15,6 +15,7 @@ enum message_context : uint32_t
 	sync_ask = 9, //transaction sequence number
 	sync_ans = 10, //last sequence number + batch of transactions
 	sync_done = 11,
+	sync_done_ack = 12,
 };
 
 enum class transaction_status : uint8_t
