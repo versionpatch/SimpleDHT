@@ -376,11 +376,11 @@ void p2p_node::read_one_message()
 				{
 					std::unique_lock u(global_transaction_lock, std::defer_lock);
 					std::shared_lock s(global_transaction_lock);
+					bool alive = true;
 					size_t seq_number = ask_msg.seq;
 					size_t last_seq_number = -1;
-					while (committed_transactions.size() > seq_number)
+					while (alive && committed_transactions.size() > seq_number)
 					{
-						//check for an update
 						bool final_phase = synchronization_batch_size > (committed_transactions.size() - seq_number);
 						if (final_phase)
 						{
@@ -413,7 +413,7 @@ void p2p_node::read_one_message()
 						//Wait for answer.
 						last_seq_number = seq_number;
 						std::unique_lock cv_lock(sync_cv_mutex);
-						sync_cv.wait(cv_lock, [&]()
+						alive = sync_cv.wait_for(cv_lock, sync_timeout_time, [&]()
 							{
 								sync_caccessor accessor;
 								sync_progress.find(accessor, ask_msg.id);
@@ -422,12 +422,19 @@ void p2p_node::read_one_message()
 							}
 						);
 					}
+					if (!alive)
+					{
+						sync_accessor delete_accessor;
+						if (sync_progress.find(delete_accessor, ask_msg.id))
+							sync_progress.erase(delete_accessor);
+						std::cout << "Failed synchronization with machine " << ask_msg.id << " : " << seq_number << "/" << committed_transactions.size() << ".\n";
+						return;
+					}
 					Message done_message;
 					done_message.header.context = message_context::sync_done;
 					con->send_message(done_message);
-					//Wait for termination recognition.
 					std::unique_lock cv_lock(sync_cv_mutex);
-					sync_cv.wait(cv_lock, [&]()
+					alive = sync_cv.wait_for(cv_lock, commit_max_time, [&]()
 						{
 							sync_caccessor accessor;
 							sync_progress.find(accessor, ask_msg.id);
@@ -437,7 +444,14 @@ void p2p_node::read_one_message()
 					sync_accessor delete_accessor;
 					if (sync_progress.find(delete_accessor, ask_msg.id))
 						sync_progress.erase(delete_accessor);
-					std::cout << "Finished synchronization with machine " << ask_msg.id << " : " << seq_number << "/" << committed_transactions.size() << ".\n";
+					if (alive)
+					{
+						std::cout << "Finished synchronization with machine " << ask_msg.id << " : " << seq_number << "/" << committed_transactions.size() << ".\n";
+					}
+					else
+					{
+						std::cout << "Failed synchronization with machine " << ask_msg.id << " : " << seq_number << "/" << committed_transactions.size() << ".\n";
+					}
 				};
 				std::thread t(handle_sync);
 				t.detach();
@@ -685,7 +699,7 @@ void p2p_node::start_2pc(const transaction &tc)
 		}
 
 		std::unique_lock lock(cv_mutex);
-		transaction_cv.wait(lock, [&]()
+		auto success = transaction_cv.wait_for(lock, commit_max_time , [&]()
 			{
 				bool finished = false;
 				xans_caccessor ans_accessor;
@@ -705,6 +719,9 @@ void p2p_node::start_2pc(const transaction &tc)
 
 		xstatus_accessor stat_accessor;
 		transaction_status_table.find(stat_accessor, xid);
+		if (!success)
+			stat_accessor->second = transaction_status::aborted;
+
 		if (stat_accessor->second == transaction_status::pending)
 		{
 			Message m = build_message(message_context::transaction_commit, tc.id);
@@ -733,21 +750,8 @@ void p2p_node::start_2pc(const transaction &tc)
 			std::cout << "[LOG] Aborted transaction " << tc.id << " successfully.\n";
 		}
 	};
-	auto timeout_work = [this, tc]()
-	{
-		std::this_thread::sleep_for(commit_max_time);
-		xstatus_accessor stat_accessor;
-		transaction_status_table.find(stat_accessor, tc.id);
-		if (stat_accessor->second == transaction_status::pending)
-			stat_accessor->second = transaction_status::aborted;
-		std::unique_lock lock(cv_mutex);
-		transaction_cv.notify_all();
-	};
 	std::thread th(work);
-	std::thread timeout(timeout_work);
-
 	th.detach();
-	timeout.detach();
 }
 
 //DEBUG

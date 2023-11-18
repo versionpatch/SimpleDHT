@@ -148,6 +148,7 @@ private:
 	std::mutex sync_cv_mutex;
 	std::condition_variable sync_cv;
 	static constexpr size_t synchronization_batch_size = 128;
+	static constexpr std::chrono::duration sync_timeout_time = std::chrono::milliseconds(5000);
 	
 	
 
