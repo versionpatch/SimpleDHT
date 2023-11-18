@@ -109,31 +109,146 @@ void p2p_node::accept_connection()
 	);
 }
 
-void p2p_node::establish_connection(uint32_t host, uint16_t port)
+std::optional<connection_ptr> p2p_node::attempt_open_connection(uint32_t host, uint16_t port)
 {
+	
 	auto soc = tcp::socket(context);
 	std::vector<tcp::endpoint> eps;
 	eps.emplace_back(asio::ip::address_v4(host), port);
 	std::error_code ec;
 	asio::connect(soc, eps, ec);
-	if (!ec)
+	if (ec)
 	{
-		std::unique_lock lock(connections_lock);
-		auto new_connection = std::make_shared<TCPConnection>(context, std::move(soc), in_messages);
-		new_connection->start_connection();
+		std::cout << "[ERROR] Failed to connect to " << host << ":" << port << " because " << ec.message() << "\n";
+		return std::nullopt;
+	}
+	std::unique_lock con_lock(connections_lock);
+	auto new_connection = std::make_shared<TCPConnection>(context, std::move(soc), in_messages);
+	new_connection->start_connection();
+	temp_connections.push_back(new_connection);
+	return std::move(new_connection);
+}
+
+void p2p_node::establish_connection(uint32_t host, uint16_t port)
+{
+	auto con = attempt_open_connection(host, port);
+	if (!con.has_value())
+		return;
+	message_format::intro payload;
+	payload.id = my_info.id;
+	payload.port = my_info.port;
+	Message msg = build_message(message_context::intro, payload);
+	(*con)->send_message(msg);
+}
+
+void p2p_node::join_ring(uint32_t host, uint16_t port)
+{
+	auto con = attempt_open_connection(host, port);
+	if (!con.has_value())
+	{
+		std::cout << "[ERROR] Could not connect to initial node...\n";
+		return;
+	}
+	std::unique_lock join_lock(join_state_mutex);
+	Message query_msg;
+	query_msg.header.context = message_context::network_info_ask;
+	query_msg.header.size = 0;
+	(*con)->send_message(query_msg);
+	received_network_info = false;
+	bool success = join_cv.wait_for(join_lock, join_timeout_time, [&]() {return received_network_info; });
+	if (!success)
+	{
+		std::cout << "[ERROR] Failed to get machine information when contacting " << host << ":" << port << "\n";
+		(*con)->close();
+		return;
+	}
+	std::unique_lock connections_lock(table_lock);
+	if (machines.size() < replication_count)
+	{
 		message_format::intro payload;
 		payload.id = my_info.id;
 		payload.port = my_info.port;
+		for (auto& [id, info] : machines)
+		{
+			if (info.host != host || info.port != port)
+				establish_connection(info.host, info.port);
+		}
 		Message msg = build_message(message_context::intro, payload);
-		new_connection->send_message(msg);
-
-		temp_connections.push_back(std::move(new_connection));
-		
+		(*con)->send_message(msg);
+		std::cout << "[LOG] Joining process finished !\n";
+		return;
 	}
+	auto it = machines.upper_bound(my_info.id);
+	if (it == machines.begin())
+		it = (--machines.end());
 	else
+		it--;
+
+	std::array<machine_info, replication_count> replica_info;
+	std::array<connection_ptr, replication_count> connection_pointers;
+	std::array<message_format::sync_ask, replication_count> messages_to_send;
+	for (size_t i = 0; i < replication_count; i++)
 	{
-		std::cout << "[ERROR] Failed to connect to " << host << ":" << port << " because " << ec.message() << "\n";
+		replica_info[i] = it->second;
+		if (it == machines.begin())
+			it = (--machines.end());
+		else
+			it--;
 	}
+	table_lock.unlock();
+	for (size_t i = 0; i < replication_count; i++)
+	{
+		auto sync_con = [&]()
+		{
+			if (replica_info[i].host == host && replica_info[i].port == port)
+				return std::make_optional(*con);
+			return attempt_open_connection(replica_info[i].host, replica_info[i].port);
+		}();
+		if (!sync_con.has_value())
+		{
+			std::cout << "[ERROR] Failed to connect to one of the replicas " << replica_info[i].host << ":" << replica_info[i].port << "\n";
+			return;
+		}
+		messages_to_send[i].lo = replica_info[i].id;
+		if (i == 0)
+			messages_to_send[i].hi = my_info.id;
+		else
+			messages_to_send[i].hi = replica_info[i-1].id;
+		messages_to_send[i].id = my_info.id;
+		messages_to_send[i].seq = 0;
+		connection_pointers[i] = std::move(*sync_con);
+	}
+	for (size_t i = 0; i < replication_count; i++)
+	{
+		std::cout << "[LOG] Started synchronization process with " << replica_info[i].id << "\n";
+		Message m = build_message(message_context::sync_ask, messages_to_send[i]);
+		connection_pointers[i]->send_message(m);
+	}
+	success = join_cv.wait_for(join_lock, full_sync_timeout_time, [&]() {return number_of_syncs_finished >= replication_count; });
+	if (!success)
+	{
+		std::cout << "[ERROR] Timeout while synchronizing.\n";
+		return;
+	}
+	table_lock.lock();
+	message_format::intro payload;
+	payload.id = my_info.id;
+	payload.port = my_info.port;
+	for (auto& [id, info] : machines)
+	{
+		if (established_connections.find(id) == established_connections.end())
+		{
+			if (info.host != host || info.port != port)
+				establish_connection(info.host, info.port);
+		}
+	}
+	connections_lock.unlock();
+	if (connection_to_id.find(*con) == connection_to_id.end())
+	{
+		Message msg = build_message(message_context::intro, payload);
+		(*con)->send_message(msg);
+	}
+	std::cout << "[LOG] Joining process finished!\n";
 }
 
 void p2p_node::connect_to_all()
@@ -195,9 +310,6 @@ void p2p_node::read_one_message()
 			if (cut_connection(content.id))
 				std::cout << "[WARNING] A machine with the same id as " << content.id << " exists. It has been forcibly disconnected.\n";
 
-			//Message record_msg = build_message(message_context::record, machine_info(con->get_hostname(), content.port, content.id));
-			//broadcast(record_msg);
-
 			add_new_machine(con, content.id, content.port);
 			if (msg.header.context == message_context::intro)
 			{
@@ -206,13 +318,6 @@ void p2p_node::read_one_message()
 				payload.port = my_info.port;
 				Message id_msg = build_message(message_context::self_id, payload);
 				con->send_message(id_msg);
-
-				std::vector<machine_info> records;
-				records.reserve(machines.size());
-				for (auto& [id, info] : machines)
-					records.push_back(info);
-				Message record_msg = build_message_array<machine_info>(message_context::record, records);
-				con->send_message(record_msg);
 			}
 			break;
 		}
@@ -221,11 +326,14 @@ void p2p_node::read_one_message()
 			std::vector<machine_info> content;
 			read_message_array<machine_info>(content, msg);
 			std::unique_lock guard(table_lock);
+			std::unique_lock guard2(join_state_mutex);
 			for (auto& info : content)
 			{
 				if (info.id != my_info.id)
 					machines[info.id] = info;
 			}
+			received_network_info = true;
+			join_cv.notify_all();
 			break;
 		}
 		case message_context::transaction_prepare :
@@ -391,22 +499,26 @@ void p2p_node::read_one_message()
 						size_t total_size = 0;
 						auto begin_it = committed_transactions.cbegin() + seq_number;
 						auto end_it = final_phase ? committed_transactions.cend() : begin_it + synchronization_batch_size;
-						size_t num_transactions_sent = final_phase ? (committed_transactions.size() - seq_number) : synchronization_batch_size;
+						size_t num_transactions_sent = 0;
+						size_t new_seq_number = seq_number + (final_phase ? (committed_transactions.size() - seq_number) : synchronization_batch_size);
 
 						Message m;
 						m.header.context = message_context::sync_ans;
 						m.header.size += 16;
 						m.data.resize(m.header.size);
-						std::memcpy(m.data.data(), &num_transactions_sent, 8);
-						std::memcpy(m.data.data() + 8, &seq_number, 8);
+						std::memcpy(m.data.data() + 8, &new_seq_number, 8);
 						for (auto it = begin_it; it != end_it; it++)
 						{
 							auto& tc = *it;
+							if (tc.key >= ask_msg.hi || tc.key < ask_msg.lo)
+								continue;
+							num_transactions_sent++;
 							size_t transaction_size = 3 * sizeof(uint64_t) + tc.data.size();
 							m.data.resize(m.header.size + transaction_size);
 							encode_transaction(m.data.data() + m.header.size, tc);
 							m.header.size += transaction_size;
 						}
+						std::memcpy(m.data.data(), &num_transactions_sent, 8);
 
 						con->send_message(m);
 
@@ -430,8 +542,7 @@ void p2p_node::read_one_message()
 						std::cout << "Failed synchronization with machine " << ask_msg.id << " : " << seq_number << "/" << committed_transactions.size() << ".\n";
 						return;
 					}
-					Message done_message;
-					done_message.header.context = message_context::sync_done;
+					Message done_message = build_message(message_context::sync_done, my_info);
 					con->send_message(done_message);
 					std::unique_lock cv_lock(sync_cv_mutex);
 					alive = sync_cv.wait_for(cv_lock, commit_max_time, [&]()
@@ -446,7 +557,7 @@ void p2p_node::read_one_message()
 						sync_progress.erase(delete_accessor);
 					if (alive)
 					{
-						std::cout << "Finished synchronization with machine " << ask_msg.id << " : " << seq_number << "/" << committed_transactions.size() << ".\n";
+						std::cout << "[LOG] Finished synchronization with machine " << ask_msg.id << " : " << seq_number << "/" << committed_transactions.size() << ".\n";
 					}
 					else
 					{
@@ -465,7 +576,7 @@ void p2p_node::read_one_message()
 			std::memcpy(&num_transactions_received, msg.data.data(), 8);
 			std::memcpy(&seq_number, msg.data.data() + 8, 8);
 			const char* cursor = msg.data.data() + 16;
-			std::cout << "[LOG] Received " << num_transactions_received << "\n";
+			std::cout << "[LOG] Received " << num_transactions_received << " transactions during synchronization." << "\n";
 			for (size_t i = 0; i < num_transactions_received; i++)
 			{
 				transaction tc(0);
@@ -473,30 +584,51 @@ void p2p_node::read_one_message()
 			}
 			message_format::sync_ask payload;
 			payload.id = my_info.id;
-			payload.seq = seq_number + num_transactions_received;
+			payload.seq = seq_number;
+			//lo and hi will be ignored in the next iterations.
+			payload.lo = 0;
+			payload.hi = 0;
 			Message m = build_message(message_context::sync_ask, payload);
 			con->send_message(m);
 			break;
 		}
 		case message_context::sync_done:
 		{
-			Message ack = build_message(message_context::sync_done_ack, my_info.id);
+			machine_info inf;
+			read_message_data(inf, msg);
+			add_new_machine(con, inf.id, inf.port);
+			Message ack = build_message(message_context::sync_done_ack, my_info);
 			con->send_message(ack);
-			std::cout << "Finished synchronization.\n";
+			std::unique_lock join_lock(join_state_mutex);
+			number_of_syncs_finished++;
+			join_cv.notify_all();
+			std::cout << "[LOG] Finished synchronization with machine " << inf.id << "\n";
 			break;
 		}
 		case message_context::sync_done_ack:
 		{
-			size_t mid;
-			read_message_data(mid, msg);
+			machine_info inf;
+			read_message_data(inf, msg);
 			sync_accessor accessor;
-			if (sync_progress.find(accessor, mid))
+			if (sync_progress.find(accessor, inf.id))
 			{
 				accessor->second = 0;
 				std::unique_lock cv_lock(sync_cv_mutex);
 				sync_cv.notify_all();
 			}
+			add_new_machine(con, inf.id, inf.port);
 			break;
+		}
+		case message_context::network_info_ask:
+		{
+			std::vector<machine_info> records;
+			std::shared_lock lc(connections_lock);
+			records.reserve(machines.size());
+			for (auto& [id, info] : machines)
+				records.push_back(info);
+			records.push_back(my_info);
+			Message record_msg = build_message_array<machine_info>(message_context::record, records);
+			con->send_message(record_msg);
 		}
 		default:
 			break;

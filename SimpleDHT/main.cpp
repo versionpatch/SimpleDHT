@@ -49,15 +49,13 @@ int main()
 			server.connect_to_all();
 		else if (port == 2)
 		{
-			size_t i = 0;
-			while (true)
+			size_t k = mt();
+			for (size_t i = 0; i < 50; i++)
 			{
-				std::this_thread::sleep_for(std::chrono::microseconds(300));
-				transaction t(i);
-				t.key = i % 3000;
+				transaction t(k + i);
+				t.key = id + i;
 				t.data.push_back(0);
 				server.start_2pc(t);
-				i++;
 			}
 		}
 		else if (port == 3)
@@ -65,7 +63,7 @@ int main()
 			server.send_sync_to_random_node();
 		}
 		else
-			server.establish_connection(localhost, port);
+			server.join_ring(localhost, port);
 	}
 	
 }

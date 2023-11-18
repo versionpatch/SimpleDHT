@@ -36,20 +36,7 @@ using sync_caccessor = tbb::concurrent_hash_map<size_t, size_t>::const_accessor;
 using sync_accessor = tbb::concurrent_hash_map<size_t, size_t>::accessor;
 
 
-struct machine_info
-{
-	uint32_t host;
-	uint16_t port;
-	uint64_t id;
-	machine_info(uint32_t ip, uint16_t p, uint64_t identifier) : host(ip), port(p), id(identifier)
-	{
 
-	}
-	machine_info() : host(0), port(0), id(0)
-	{
-
-	}
-};
 
 struct transaction
 {
@@ -64,6 +51,7 @@ struct transaction
 
 };
 
+ 
 
 class p2p_node
 {
@@ -75,6 +63,7 @@ public:
 	
 	void start();
 	void establish_connection(uint32_t host, uint16_t port);
+	void join_ring(uint32_t host, uint16_t port);
 	void connect_to_all();
 	void read_one_message();
 	
@@ -99,6 +88,7 @@ private:
 	void add_new_machine(const machine_info& inf);
 	void broadcast(const Message &m);
 	void cleanup_connection_tables();
+	std::optional<connection_ptr> attempt_open_connection(uint32_t host, uint16_t port);
 	int get_node_index(size_t id);
 	std::shared_mutex table_lock;
 
@@ -149,6 +139,15 @@ private:
 	std::condition_variable sync_cv;
 	static constexpr size_t synchronization_batch_size = 128;
 	static constexpr std::chrono::duration sync_timeout_time = std::chrono::milliseconds(5000);
+
+	//Join state
+	std::mutex join_state_mutex;
+	size_t number_of_syncs_finished = 0;
+	bool received_network_info = false;
+	std::condition_variable join_cv;
+	static constexpr std::chrono::duration join_timeout_time = std::chrono::milliseconds(5000);
+	static constexpr std::chrono::duration full_sync_timeout_time = std::chrono::milliseconds(600000);
+
 	
 	
 
