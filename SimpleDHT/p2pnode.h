@@ -131,12 +131,12 @@ private:
 	//Data handling
 	tbb::concurrent_hash_map<size_t, std::vector<char>> data_storage;
 	tbb::concurrent_set<size_t> keys;
-	tbb::concurrent_vector<transaction> committed_transactions;
 
 	//Synchronization
 	tbb::concurrent_hash_map<size_t, size_t> sync_progress;
 	std::mutex sync_cv_mutex;
 	std::condition_variable sync_cv;
+	tbb::concurrent_vector<size_t> keys_to_send;
 	static constexpr size_t synchronization_batch_size = 128;
 	static constexpr std::chrono::duration sync_timeout_time = std::chrono::milliseconds(5000);
 
