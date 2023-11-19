@@ -184,10 +184,10 @@ void p2p_node::join_ring(uint32_t host, uint16_t port)
 	else
 		it--;
 
-	std::array<machine_info, replication_count> replica_info;
-	std::array<connection_ptr, replication_count> connection_pointers;
-	std::array<message_format::sync_ask, replication_count> messages_to_send;
-	for (size_t i = 0; i < replication_count; i++)
+	std::array<machine_info, replication_count-1> replica_info;
+	std::array<connection_ptr, replication_count-1> connection_pointers;
+	std::array<message_format::sync_ask, replication_count-1> messages_to_send;
+	for (size_t i = 0; i < replication_count-1; i++)
 	{
 		replica_info[i] = it->second;
 		if (it == machines.begin())
@@ -196,7 +196,7 @@ void p2p_node::join_ring(uint32_t host, uint16_t port)
 			it--;
 	}
 	table_lock.unlock();
-	for (size_t i = 0; i < replication_count; i++)
+	for (size_t i = 0; i < replication_count-1; i++)
 	{
 		auto sync_con = [&]()
 		{
@@ -218,13 +218,13 @@ void p2p_node::join_ring(uint32_t host, uint16_t port)
 		messages_to_send[i].seq = 0;
 		connection_pointers[i] = std::move(*sync_con);
 	}
-	for (size_t i = 0; i < replication_count; i++)
+	for (size_t i = 0; i < replication_count-1; i++)
 	{
 		std::cout << "[LOG] Started synchronization process with " << replica_info[i].id << "\n";
 		Message m = build_message(message_context::sync_ask, messages_to_send[i]);
 		connection_pointers[i]->send_message(m);
 	}
-	success = join_cv.wait_for(join_lock, full_sync_timeout_time, [&]() {return number_of_syncs_finished >= replication_count; });
+	success = join_cv.wait_for(join_lock, full_sync_timeout_time, [&]() {return number_of_syncs_finished >= replication_count - 1; });
 	if (!success)
 	{
 		std::cout << "[ERROR] Timeout while synchronizing.\n";
