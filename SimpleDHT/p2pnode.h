@@ -76,6 +76,7 @@ public:
 	//debug
 	void log_machine_table();
 	void send_sync_to_random_node();
+	void log_data();
 
 private:
 

@@ -29,6 +29,7 @@ int main()
 	std::random_device rd;
 	std::mt19937_64 mt(rd());
 	uint64_t id = mt();
+	id = serv_port * 10000;
 	p2p_node server(serv_port, id);
 	server.start();
 	std::thread thd([&server]()
@@ -50,8 +51,9 @@ int main()
 		else if (port == 2)
 		{
 			size_t k = mt();
-			for (size_t i = 0; i < 50; i++)
+			for (size_t i = 0; i < 5000; i++)
 			{
+				std::this_thread::sleep_for(std::chrono::milliseconds(2));
 				transaction t(k + i);
 				t.key = id + i;
 				t.data.push_back(0);
@@ -61,6 +63,10 @@ int main()
 		else if (port == 3)
 		{
 			server.send_sync_to_random_node();
+		}
+		else if (port == 4)
+		{
+			server.log_data();
 		}
 		else
 			server.join_ring(localhost, port);

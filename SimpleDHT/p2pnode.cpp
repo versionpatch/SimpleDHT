@@ -373,9 +373,7 @@ void p2p_node::read_one_message()
 			auto handle_new_transaction = [this, con, tc]()
 			{
 				data_accessor accessor;
-				bool new_key = !data_storage.find(accessor, tc.key);
-				if (new_key)
-					data_storage.insert(accessor, tc.key);
+				bool new_key = data_storage.insert(accessor, tc.key);
 
 				Message m = build_message(message_context::transaction_accept, tc.id);
 				con->send_message(m);
@@ -397,7 +395,10 @@ void p2p_node::read_one_message()
 					accessor->second = tc.data;
 					if (new_key)
 						keys.insert(tc.key);
-					std::cout << "[LOG] Committed transaction " << tc.id << " successfully.\n";
+					if (sync_progress.size() > 0)
+						keys_to_send.push_back(tc.key);
+					accessor.release();
+					std::cout << "[LOG] Committed transaction " << tc.id << " on key " << tc.key << " successfully.\n";
 				}
 				else
 				{
@@ -515,6 +516,7 @@ void p2p_node::read_one_message()
 				accessor->second = ask_msg.seq;
 				accessor.release();
 				block_transaction_lock.unlock();
+				std::cout << "[LOG] Key list established, starting sending process.\n";
 				auto handle_sync = [this, ask_msg, con]()
 				{
 					std::unique_lock u(global_transaction_lock, std::defer_lock);
@@ -550,15 +552,15 @@ void p2p_node::read_one_message()
 							num_transactions_sent++;
 							data_caccessor ac;
 							data_storage.find(ac, key);
-							size_t transaction_size = 3 * sizeof(uint64_t) + ac->second.size();
+							size_t transaction_size = 2 * sizeof(uint64_t) + ac->second.size();
 							m.data.resize(m.header.size + transaction_size);
 							encode_kv(m.data.data() + m.header.size, key, ac->second);
 							m.header.size += transaction_size;
-							std::cout << "shmoving\n";
 						}
 						std::memcpy(m.data.data(), &num_transactions_sent, 8);
 
 						con->send_message(m);
+						std::cout << "Synchronization with machine " << ask_msg.id << " : " << new_seq_number << "/" << keys_to_send.size() << ".\n";
 						//Wait for answer.
 						last_seq_number = seq_number;
 						std::unique_lock cv_lock(sync_cv_mutex);
@@ -858,9 +860,7 @@ void p2p_node::start_2pc(const transaction &tc)
 		}
 
 		data_accessor accessor;
-		bool new_key = !data_storage.find(accessor, tc.key);
-		if (new_key)
-			data_storage.insert(accessor, new_key);
+		bool new_key = data_storage.insert(accessor, tc.key);
 		
 		Message prepare_msg = encode_transaction(tc);
 		for (auto replica : replicas_id)
@@ -905,8 +905,8 @@ void p2p_node::start_2pc(const transaction &tc)
 			if (sync_progress.size() > 0)
 				keys_to_send.push_back(tc.key);
 			stat_accessor->second = transaction_status::committed;
-
-			std::cout << "[LOG] Committed transaction " << tc.id << " successfully.\n";
+			accessor.release();
+			std::cout << "[LOG] Committed transaction " << tc.id << " on key " << tc.key << " successfully.\n";
 		}
 		else
 		{
@@ -916,7 +916,9 @@ void p2p_node::start_2pc(const transaction &tc)
 				established_connections[replica]->send_message(m);
 			}
 			if (new_key)
+			{
 				data_storage.erase(accessor);
+			}
 			std::cout << "[LOG] Aborted transaction " << tc.id << " successfully.\n";
 		}
 	};
@@ -949,4 +951,15 @@ void p2p_node::send_sync_to_random_node()
 	Message m = build_message(message_context::sync_ask, first_ask);
 	auto it = established_connections.begin();
 	it->second->send_message(m);
+}
+
+void p2p_node::log_data()
+{
+	std::shared_lock trans_lock(global_transaction_lock);
+	for (auto it = keys.cbegin(); it != keys.cend(); it++)
+	{
+		data_accessor acc;
+		data_storage.find(acc, *it);
+		std::cout << "(" << acc->first << "," << acc->second.size() << ")\n";
+	}
 }
