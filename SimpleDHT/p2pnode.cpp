@@ -303,8 +303,11 @@ void p2p_node::add_new_machine(connection_ptr ptr, uint64_t id, uint16_t port)
 	if (sit == connected_ids.end() || *sit != id)
 		connected_ids.insert(std::upper_bound(connected_ids.begin(), connected_ids.end(), id), id);
 	
-	if (id >= my_info.id && id < my_succesor || my_succesor == my_info.id)
-		my_succesor = id;
+	auto it = std::lower_bound(connected_ids.begin(), connected_ids.end(), my_info.id);
+	int idx = std::distance(connected_ids.begin(), it);
+	int new_idx = (idx + 1) % (connected_ids.size());
+	my_succesor = connected_ids[new_idx];
+
 	if (connected_ids.size() >= replication_count)
 	{
 		auto it = std::lower_bound(connected_ids.begin(), connected_ids.end(), my_info.id);
@@ -414,7 +417,7 @@ void p2p_node::read_one_message()
 					if (sync_progress.size() > 0)
 						keys_to_send.push_back(tc.key);
 					accessor.release();
-					std::cout << "[LOG] Committed transaction " << tc.id << " on key " << tc.key << " successfully.\n";
+					//std::cout << "[LOG] Committed transaction " << tc.id << " on key " << tc.key << " successfully.\n";
 				}
 				else
 				{
@@ -902,12 +905,10 @@ void p2p_node::start_2pc(const transaction &tc)
 		std::vector<size_t> replicas_id = std::vector<size_t>();
 
 		int idx = get_node_index(my_info.id);
+		std::shared_lock contable_lock(table_lock);
+		for (size_t i = 1; i < replication_count; i++)
 		{
-			std::shared_lock contable_lock(table_lock);
-			for (size_t i = 1; i < replication_count; i++)
-			{
-				replicas_id.push_back(connected_ids[(idx + i) % connected_ids.size()]);
-			}
+			replicas_id.push_back(connected_ids[(idx + i) % connected_ids.size()]);
 		}
 
 		data_accessor accessor;
@@ -918,6 +919,7 @@ void p2p_node::start_2pc(const transaction &tc)
 		{
 			established_connections[replica]->send_message(prepare_msg);
 		}
+		contable_lock.unlock();
 
 		std::unique_lock lock(cv_mutex);
 		auto success = transaction_cv.wait_for(lock, commit_max_time , [&]()
@@ -948,7 +950,8 @@ void p2p_node::start_2pc(const transaction &tc)
 			Message m = build_message(message_context::transaction_commit, tc.id);
 			for (auto replica : replicas_id)
 			{
-				established_connections[replica]->send_message(m);
+				if (established_connections.find(replica) != established_connections.end())
+					established_connections[replica]->send_message(m);
 			}
 			accessor->second = tc.data;
 			if (new_key)
@@ -957,14 +960,15 @@ void p2p_node::start_2pc(const transaction &tc)
 				keys_to_send.push_back(tc.key);
 			stat_accessor->second = transaction_status::committed;
 			accessor.release();
-			std::cout << "[LOG] Committed transaction " << tc.id << " on key " << tc.key << " successfully.\n";
+			//std::cout << "[LOG] Committed transaction " << tc.id << " on key " << tc.key << " successfully.\n";
 		}
 		else
 		{
 			Message m = build_message(message_context::transaction_abort, tc.id);
 			for (auto replica : replicas_id)
 			{	
-				established_connections[replica]->send_message(m);
+				if (established_connections.find(replica) != established_connections.end())
+					established_connections[replica]->send_message(m);
 			}
 			if (new_key)
 			{
@@ -984,8 +988,9 @@ void p2p_node::on_successor_dead()
 	size_t old_successor = my_succesor;
 	auto it = std::lower_bound(connected_ids.begin(), connected_ids.end(), my_info.id);
 	int idx = std::distance(connected_ids.begin(), it);
-	int new_idx = (connected_ids.size() + idx + 1) % (connected_ids.size());
+	int new_idx = (idx + 1) % (connected_ids.size());
 	my_succesor = connected_ids[new_idx];
+	std::cout << my_succesor << '\n';
 	if (my_succesor != my_info.id)
 	{
 		message_format::sync_ask recovery_msg;
@@ -1041,6 +1046,7 @@ void p2p_node::log_machine_table()
 		std::cout << id << ",";
 	}
 	std::cout << '\n';
+	std::cout << "My successor : " << my_succesor << ", my farthest parent : " << my_farthest_parent << "\n";
 }
 
 void p2p_node::send_sync_to_random_node()
