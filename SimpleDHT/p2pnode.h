@@ -85,6 +85,8 @@ private:
 	std::unordered_map<size_t, connection_ptr> established_connections;
 	std::unordered_map<connection_ptr, size_t> connection_to_id;
 	std::vector<size_t> connected_ids;
+	size_t my_succesor;
+	size_t my_farthest_parent;
 	void add_new_machine(connection_ptr ptr, uint64_t id, uint16_t port);
 	void add_new_machine(const machine_info& inf);
 	void broadcast(const Message &m);
@@ -92,7 +94,6 @@ private:
 	std::optional<connection_ptr> attempt_open_connection(uint32_t host, uint16_t port);
 	int get_node_index(size_t id);
 	std::shared_mutex table_lock;
-
 	std::vector<connection_ptr> temp_connections;
 	std::shared_mutex connections_lock;
 
@@ -149,13 +150,12 @@ private:
 	static constexpr std::chrono::duration join_timeout_time = std::chrono::milliseconds(5000);
 	static constexpr std::chrono::duration full_sync_timeout_time = std::chrono::milliseconds(600000);
 
-	
-	
-
-
-		
+	//Recovery
+	void on_successor_dead();
+	void on_far_parent_dead();
 
 	//personal information
 	machine_info my_info;
+
 
 };

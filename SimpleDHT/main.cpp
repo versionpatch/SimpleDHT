@@ -51,9 +51,9 @@ int main()
 		else if (port == 2)
 		{
 			size_t k = mt();
-			for (size_t i = 0; i < 5000; i++)
+			for (size_t i = 0; i < 15000; i++)
 			{
-				std::this_thread::sleep_for(std::chrono::milliseconds(2));
+				std::this_thread::sleep_for(std::chrono::microseconds(333));
 				transaction t(k + i);
 				t.key = id + i;
 				t.data.push_back(0);

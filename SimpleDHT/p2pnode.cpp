@@ -82,7 +82,9 @@ p2p_node::p2p_node(uint16_t port, size_t id) :
 	garbage_collection_timer(context, garbage_collection_interval),
 	heartbeat_send_timer(context, heartbeat_send_interval),
 	heartbeat_process_timer(context, heartbeat_check_interval),
-	my_info(localhost, port, id)
+	my_info(localhost, port, id),
+	my_succesor(id),
+	my_farthest_parent(id)
 {
 	connected_ids.push_back(id);
 }
@@ -297,6 +299,14 @@ void p2p_node::add_new_machine(connection_ptr ptr, uint64_t id, uint16_t port)
 	established_connections[id] = ptr;
 	machines[id] = machine_info(ptr->get_hostname(), port, id);
 	connected_ids.insert(std::upper_bound(connected_ids.begin(), connected_ids.end(), id), id);
+	if (id >= my_info.id && id < my_succesor || my_succesor == my_info.id)
+		my_succesor = id;
+	if (connected_ids.size() >= replication_count)
+	{
+		auto it = std::lower_bound(connected_ids.begin(), connected_ids.end(), my_info.id);
+		int idx = std::distance(connected_ids.begin(), connected_ids.end());
+		my_farthest_parent = connected_ids[(connected_ids.size() + idx - replication_count + 1) % (connected_ids.size())];
+	}
 }
 
 void p2p_node::add_new_machine(const machine_info &inf)
@@ -754,6 +764,12 @@ void p2p_node::cleanup_connection_tables()
 			if (con != nullptr)
 				connection_to_id.erase(con);
 			connected_ids.erase(std::find(connected_ids.begin(), connected_ids.end(), id));
+
+			if (id == my_succesor)
+				on_successor_dead();
+			else if (id == my_farthest_parent)
+				on_far_parent_dead();
+
 			it = established_connections.erase(it);
 		}
 		else
@@ -799,7 +815,14 @@ void p2p_node::handle_heartbeat()
 						connection_to_id.erase(con);
 					}
 					connected_ids.erase(std::find(connected_ids.begin(), connected_ids.end(), id));
+
+					if (id == my_succesor)
+						on_successor_dead();
+					else if (id == my_farthest_parent)
+						on_far_parent_dead();
+
 					it = established_connections.erase(it);
+					
 				}
 				else
 				{
@@ -926,6 +949,27 @@ void p2p_node::start_2pc(const transaction &tc)
 	th.detach();
 }
 
+//Recovery
+
+void p2p_node::on_successor_dead()
+{
+	auto new_suc_it = std::upper_bound(connected_ids.begin(), connected_ids.end(), my_info.id);
+	if (new_suc_it != connected_ids.end())
+		my_succesor = *new_suc_it;
+	else
+		my_succesor = *connected_ids.begin();
+}
+void p2p_node::on_far_parent_dead()
+{
+	if (connected_ids.size() >= replication_count)
+	{
+		auto it = std::lower_bound(connected_ids.begin(), connected_ids.end(), my_info.id);
+		int idx = std::distance(connected_ids.begin(), connected_ids.end());
+		my_farthest_parent = connected_ids[(connected_ids.size() + idx - replication_count + 1) % (connected_ids.size())];
+	}
+	else
+		my_farthest_parent = my_info.id;
+}
 //DEBUG
 void p2p_node::log_machine_table()
 {
