@@ -304,7 +304,7 @@ void p2p_node::add_new_machine(connection_ptr ptr, uint64_t id, uint16_t port)
 	if (connected_ids.size() >= replication_count)
 	{
 		auto it = std::lower_bound(connected_ids.begin(), connected_ids.end(), my_info.id);
-		int idx = std::distance(connected_ids.begin(), connected_ids.end());
+		int idx = std::distance(connected_ids.begin(), it);
 		my_farthest_parent = connected_ids[(connected_ids.size() + idx - replication_count + 1) % (connected_ids.size())];
 	}
 }
@@ -961,14 +961,31 @@ void p2p_node::on_successor_dead()
 }
 void p2p_node::on_far_parent_dead()
 {
+	
+	size_t old_farthest_parent = my_farthest_parent;
+
 	if (connected_ids.size() >= replication_count)
 	{
 		auto it = std::lower_bound(connected_ids.begin(), connected_ids.end(), my_info.id);
-		int idx = std::distance(connected_ids.begin(), connected_ids.end());
-		my_farthest_parent = connected_ids[(connected_ids.size() + idx - replication_count + 1) % (connected_ids.size())];
+		int idx = std::distance(connected_ids.begin(), it);
+		int new_idx = (connected_ids.size() + idx - replication_count + 1) % (connected_ids.size());
+		my_farthest_parent = connected_ids[new_idx];
 	}
 	else
 		my_farthest_parent = my_info.id;
+
+
+	if (my_farthest_parent != my_info.id)
+	{
+		message_format::sync_ask recovery_msg;
+		recovery_msg.lo = my_farthest_parent;
+		recovery_msg.hi = old_farthest_parent;
+		recovery_msg.seq = 0;
+		recovery_msg.id = my_info.id;
+		Message m = build_message(message_context::sync_ask, recovery_msg);
+		established_connections[my_farthest_parent]->send_message(m);
+	}
+
 }
 //DEBUG
 void p2p_node::log_machine_table()
