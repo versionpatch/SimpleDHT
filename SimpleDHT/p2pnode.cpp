@@ -298,7 +298,11 @@ void p2p_node::add_new_machine(connection_ptr ptr, uint64_t id, uint16_t port)
 	connection_to_id[ptr] = id;
 	established_connections[id] = ptr;
 	machines[id] = machine_info(ptr->get_hostname(), port, id);
-	connected_ids.insert(std::upper_bound(connected_ids.begin(), connected_ids.end(), id), id);
+	auto sit = std::lower_bound(connected_ids.begin(), connected_ids.end(), id);
+
+	if (sit == connected_ids.end() || *sit != id)
+		connected_ids.insert(std::upper_bound(connected_ids.begin(), connected_ids.end(), id), id);
+	
 	if (id >= my_info.id && id < my_succesor || my_succesor == my_info.id)
 		my_succesor = id;
 	if (connected_ids.size() >= replication_count)
@@ -382,6 +386,8 @@ void p2p_node::read_one_message()
 			}
 			auto handle_new_transaction = [this, con, tc]()
 			{
+				std::shared_lock global_lock(global_transaction_lock);
+
 				data_accessor accessor;
 				bool new_key = data_storage.insert(accessor, tc.key);
 
@@ -502,31 +508,42 @@ void p2p_node::read_one_message()
 			message_format::sync_ask ask_msg;
 			read_message_data(ask_msg, msg);
 			sync_accessor accessor;
-			std::cout << "[LOG] Received ask message " << ask_msg.id << ", " << ask_msg.seq << "\n";
 			if (sync_progress.find(accessor, ask_msg.id))
 			{
-				std::cout << "[LOG] Moving sync process for machine " << ask_msg.id << " to " << ask_msg.seq << ".\n";
 				accessor->second = ask_msg.seq;
 				std::unique_lock cv_lock(sync_cv_mutex);
 				sync_cv.notify_all();
 			}
 			else
 			{
-				std::cout << "[LOG] Starting sync process for machine " << ask_msg.id << " at " << ask_msg.seq << ".\n";
+				std::cout << "[LOG] Starting sync process for machine " << ask_msg.id << " at " << ask_msg.seq << " from " << ask_msg.lo << " to " << ask_msg.hi << ".\n";
 				std::unique_lock block_transaction_lock(global_transaction_lock);
 				if (sync_progress.size() == 0)
 				{
 					keys_to_send.clear();
-					for (auto it = keys.lower_bound(ask_msg.lo); it != keys.lower_bound(ask_msg.hi); it++)
+					if (ask_msg.lo <= ask_msg.hi)
 					{
-						keys_to_send.push_back(*it);
+						for (auto it = keys.lower_bound(ask_msg.lo); it != keys.lower_bound(ask_msg.hi); it++)
+						{
+							keys_to_send.push_back(*it);
+						}
+					}
+					else
+					{
+						for (auto it = keys.lower_bound(ask_msg.lo); it != keys.end(); it++)
+						{
+							keys_to_send.push_back(*it);
+						}
+						for (auto it = keys.begin(); it != keys.lower_bound(ask_msg.hi); it++)
+						{
+							keys_to_send.push_back(*it);
+						}
 					}
 				}
 				sync_progress.insert(accessor, ask_msg.id);
 				accessor->second = ask_msg.seq;
 				accessor.release();
 				block_transaction_lock.unlock();
-				std::cout << "[LOG] Key list established, starting sending process.\n";
 				auto handle_sync = [this, ask_msg, con]()
 				{
 					std::unique_lock u(global_transaction_lock, std::defer_lock);
@@ -557,8 +574,16 @@ void p2p_node::read_one_message()
 						for (auto it = begin_it; it != end_it; it++)
 						{
 							auto& key = *it;
-							if (key >= ask_msg.hi || key < ask_msg.lo)
-								continue;
+							if (ask_msg.lo <= ask_msg.hi)
+							{
+								if (key >= ask_msg.hi || key < ask_msg.lo)
+									continue;
+							}
+							else
+							{
+								if (key < ask_msg.lo && key >= ask_msg.hi)
+									continue;
+							}
 							num_transactions_sent++;
 							data_caccessor ac;
 							data_storage.find(ac, key);
@@ -570,7 +595,6 @@ void p2p_node::read_one_message()
 						std::memcpy(m.data.data(), &num_transactions_sent, 8);
 
 						con->send_message(m);
-						std::cout << "Synchronization with machine " << ask_msg.id << " : " << new_seq_number << "/" << keys_to_send.size() << ".\n";
 						//Wait for answer.
 						last_seq_number = seq_number;
 						std::unique_lock cv_lock(sync_cv_mutex);
@@ -625,12 +649,16 @@ void p2p_node::read_one_message()
 			std::memcpy(&num_transactions_received, msg.data.data(), 8);
 			std::memcpy(&seq_number, msg.data.data() + 8, 8);
 			const char* cursor = msg.data.data() + 16;
-			std::cout << "[LOG] Received " << num_transactions_received << " transactions during synchronization." << "\n";
 			for (size_t i = 0; i < num_transactions_received; i++)
 			{
 				size_t k;
 				std::vector<char> v;
 				cursor = decode_kv(k, v, cursor);
+				data_accessor acc;
+				data_storage.insert(acc, k);
+				acc->second = std::move(v);
+				keys.insert(k);
+				acc.release();
 			}
 			message_format::sync_ask payload;
 			payload.id = my_info.id;
@@ -953,11 +981,21 @@ void p2p_node::start_2pc(const transaction &tc)
 
 void p2p_node::on_successor_dead()
 {
-	auto new_suc_it = std::upper_bound(connected_ids.begin(), connected_ids.end(), my_info.id);
-	if (new_suc_it != connected_ids.end())
-		my_succesor = *new_suc_it;
-	else
-		my_succesor = *connected_ids.begin();
+	size_t old_successor = my_succesor;
+	auto it = std::lower_bound(connected_ids.begin(), connected_ids.end(), my_info.id);
+	int idx = std::distance(connected_ids.begin(), it);
+	int new_idx = (connected_ids.size() + idx + 1) % (connected_ids.size());
+	my_succesor = connected_ids[new_idx];
+	if (my_succesor != my_info.id)
+	{
+		message_format::sync_ask recovery_msg;
+		recovery_msg.lo = old_successor;
+		recovery_msg.hi = my_succesor;
+		recovery_msg.seq = 0;
+		recovery_msg.id = my_info.id;
+		Message m = build_message(message_context::sync_ask, recovery_msg);
+		established_connections[my_succesor]->send_message(m);
+	}
 }
 void p2p_node::on_far_parent_dead()
 {
@@ -987,6 +1025,7 @@ void p2p_node::on_far_parent_dead()
 	}
 
 }
+
 //DEBUG
 void p2p_node::log_machine_table()
 {
