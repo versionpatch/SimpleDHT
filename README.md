@@ -1,5 +1,7 @@
 # SimpleDHT
 
+## This is a personal project where I try to build a distributed system myself from scratch. It is not meant to be used in practice and is not secure.
+
 Peer to Peer, all the machines know each other.
 
 Uses consistent hashing for data distribution.
